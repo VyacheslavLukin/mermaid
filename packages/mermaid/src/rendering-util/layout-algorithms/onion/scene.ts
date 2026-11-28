@@ -204,9 +204,16 @@ export interface ScanResult {
 
 /**
  * Counts overlaps between nodes, frames, titles, labels and edges, and slides every label along
- * its edge to the first spot that clears them (centre first, then outwards).
+ * its edge to the first spot that clears them (centre first, then outwards). With a `limit` the
+ * scan stops as soon as the count reaches it: the count is then exactly `limit` and the labels
+ * are incomplete, which is all a caller asking "at most this many?" needs.
  */
-export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult {
+export function scan(
+  ctx: Context,
+  scene: Scene,
+  detailed: boolean,
+  limit = Number.POSITIVE_INFINITY
+): ScanResult {
   let count = 0;
   const report: string[] = [];
   const involved = new Set<string>();
@@ -217,6 +224,8 @@ export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult 
       ids.forEach((id) => involved.add(id));
     }
   };
+  const labels = new Map<string, Box>();
+  const done = (): ScanResult => ({ count, labels, report, involved });
   const entries = [...scene.boxes];
   const half = NODE_GAP / 2;
   const grownBoxes = entries.map(([, b]) => inflateBox(b, half));
@@ -226,6 +235,9 @@ export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult 
     for (let j = i + 1; j < entries.length; j++) {
       if (boxesOverlap(grownA, grownBoxes[j])) {
         note(() => `node ${idA} x node ${entries[j][0]}`, idA, entries[j][0]);
+        if (count >= limit) {
+          return done();
+        }
       }
     }
     for (const frame of scene.frames) {
@@ -240,13 +252,14 @@ export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult 
         note(() => `node ${idA} x title ${frame.id}`, idA);
       }
     }
+    if (count >= limit) {
+      return done();
+    }
   }
 
-  const labels = new Map<string, Box>();
-  const placed: Box[] = [];
-  const quarter = NODE_GAP / 4;
-  const grownNodes = entries.map(([id, b]) => ({ id, box: inflateBox(b, quarter) }));
-  const lines = edgeSegments(ctx, scene);
+  // Edges against nodes, titles and rings first: a count that only has to reach `limit` usually
+  // gets there before the label search below, which is the costly part.
+  const routes: [LabeledEdge, EdgeSegment][] = [];
   for (const edge of ctx.edges) {
     const src = scene.boxes.get(edge.start);
     const dst = scene.boxes.get(edge.end);
@@ -254,6 +267,7 @@ export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult 
       continue;
     }
     const seg = edgeSegment(ctx, edge, src, dst);
+    routes.push([edge, seg]);
     for (const [id, box] of entries) {
       if (
         id !== edge.start &&
@@ -271,19 +285,30 @@ export function scan(ctx: Context, scene: Scene, detailed: boolean): ScanResult 
         note(() => `edge ${edge.id} through frame ${frame.id}`, edge.start, edge.end);
       }
     }
+    if (count >= limit) {
+      return done();
+    }
+  }
+
+  const placed: Box[] = [];
+  const quarter = NODE_GAP / 4;
+  const grownNodes = entries.map(([id, b]) => ({ id, box: inflateBox(b, quarter) }));
+  const lines = new Map(routes.map(([edge, seg]) => [edge.id, seg]));
+  for (const [edge, seg] of routes) {
     if (!edge.label) {
       continue;
     }
     const spot = bestLabelSpot(edge.id, edge.label, seg, grownNodes, scene.frames, placed, lines);
-    const bestBox = spot.box;
-    const bestHits = spot.hits;
-    labels.set(edge.id, bestBox);
-    placed.push(paddedLabel(bestBox, seg));
-    for (let h = 0; h < bestHits; h++) {
+    labels.set(edge.id, spot.box);
+    placed.push(paddedLabel(spot.box, seg));
+    for (let h = 0; h < spot.hits; h++) {
       note(() => `label ${edge.id} blocked`, edge.start, edge.end);
     }
+    if (count >= limit) {
+      return done();
+    }
   }
-  return { count, labels, report, involved };
+  return done();
 }
 
 /** Deepest a segment may cut into a ring it has no end in, in px: a graze is not a crossing. */
@@ -311,8 +336,13 @@ function crossesForeignFrame(edge: LabeledEdge, seg: EdgeSegment, frame: FrameSh
   return inside !== undefined && (inside[1] - inside[0]) * length > 2 * FRAME_GRAZE;
 }
 
-export function countConflicts(ctx: Context, scene: Scene): number {
-  return scan(ctx, scene, false).count;
+/** Overlaps in the scene, counted up to `limit` at most (see `scan`). */
+export function countConflicts(
+  ctx: Context,
+  scene: Scene,
+  limit = Number.POSITIVE_INFINITY
+): number {
+  return Math.min(scan(ctx, scene, false, limit).count, limit);
 }
 
 /** Padded label boxes the scene settles on, for scoring one more node against them. */
@@ -329,13 +359,14 @@ export function placedLabels(ctx: Context, scene: Scene): Box[] {
 /**
  * Overlaps caused by one node that was just added to a scene that was otherwise settled:
  * what `scan` would add, without rescanning the rest. `labels` come from `placedLabels`
- * taken before the node existed.
+ * taken before the node existed. Counted up to `limit` at most, as `scan` does.
  */
 export function scanNewNode(
   ctx: Context,
   scene: Scene,
   id: string,
-  labels: readonly Box[]
+  labels: readonly Box[],
+  limit = Number.POSITIVE_INFINITY
 ): number {
   const box = scene.boxes.get(id)!;
   const half = NODE_GAP / 2;
@@ -357,14 +388,16 @@ export function scanNewNode(
       count++;
     }
   }
-  const nodes = entries.map(([nid, b]) => ({ id: nid, box: inflateBox(b, NODE_GAP / 4) }));
-  const taken = [...labels];
-  const lines = edgeSegments(ctx, scene);
+  if (count >= limit) {
+    return limit;
+  }
   for (const l of labels) {
     if (boxesOverlap(l, inflateBox(box, NODE_GAP / 4))) {
       count++;
     }
   }
+  // Edge geometry first, labels after, as in `scan`.
+  const own: [LabeledEdge, EdgeSegment][] = [];
   for (const edge of ctx.edges) {
     const src = scene.boxes.get(edge.start);
     const dst = scene.boxes.get(edge.end);
@@ -378,6 +411,7 @@ export function scanNewNode(
       }
       continue;
     }
+    own.push([edge, seg]);
     for (const [oid, b] of entries) {
       if (
         oid !== edge.start &&
@@ -392,11 +426,22 @@ export function scanNewNode(
         count++;
       }
     }
+  }
+  if (count >= limit) {
+    return limit;
+  }
+  const nodes = entries.map(([nid, b]) => ({ id: nid, box: inflateBox(b, NODE_GAP / 4) }));
+  const taken = [...labels];
+  const lines = edgeSegments(ctx, scene);
+  for (const [edge, seg] of own) {
     if (edge.label) {
       const spot = bestLabelSpot(edge.id, edge.label, seg, nodes, scene.frames, taken, lines);
       count += spot.hits;
       taken.push(paddedLabel(spot.box, seg));
     }
+    if (count >= limit) {
+      return limit;
+    }
   }
-  return count;
+  return Math.min(count, limit);
 }

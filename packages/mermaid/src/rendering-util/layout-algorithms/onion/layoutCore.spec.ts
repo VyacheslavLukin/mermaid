@@ -55,10 +55,33 @@ beforeAll(async () => {
   }
 });
 
-/** A fresh copy of a measured fixture, so each test lays out its own. */
+/** A fresh copy of a measured fixture, for a test that lays it out its own way. */
 function loadLayoutData(name: FixtureName): LayoutData {
   return JSON.parse(measured.get(name)!) as LayoutData;
 }
+
+const laidOutCache = new Map<string, { data: LayoutData; result: OnionResult }>();
+
+/**
+ * A fixture laid out once per arrangement, shared by the tests that only read the result: the
+ * search makes each layout cost up to a second, several times that under coverage.
+ */
+function laidOut(
+  name: FixtureName,
+  arrangement: OnionArrangement
+): { data: LayoutData; result: OnionResult } {
+  const key = `${name}/${arrangement}`;
+  let entry = laidOutCache.get(key);
+  if (!entry) {
+    const data = loadLayoutData(name);
+    entry = { data, result: runOnionLayoutCore(data, arrangement) };
+    laidOutCache.set(key, entry);
+  }
+  return entry;
+}
+
+/** Room for the first test of a fixture, which pays for its layout, in a run with coverage on. */
+const FIXTURE_TIMEOUT = { timeout: 30_000 };
 
 function leaf(id: string, parentId?: string): Node {
   return { id, parentId, isGroup: false, shape: 'rect', width: 120, height: 60 } as Node;
@@ -237,16 +260,14 @@ const CLEAN = {
   conflicts: [],
 };
 
-describe('runOnionLayoutCore on the order service onion', () => {
+describe('runOnionLayoutCore on the order service onion', FIXTURE_TIMEOUT, () => {
   it.each(ARRANGEMENTS)('keeps every rule in the %s arrangement', (arrangement) => {
-    const data = loadLayoutData('order-service');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('order-service', arrangement);
     expect(allInvariants(data, result, arrangement)).toEqual(CLEAN);
   });
 
   it.each(ARRANGEMENTS)('centres every ring and the domain on the origin (%s)', (arrangement) => {
-    const data = loadLayoutData('order-service');
-    runOnionLayoutCore(data, arrangement);
+    const { data } = laidOut('order-service', arrangement);
     for (const n of ringFrames(data)) {
       expect([n.x, n.y]).toEqual([0, 0]);
     }
@@ -257,8 +278,7 @@ describe('runOnionLayoutCore on the order service onion', () => {
   });
 
   it('puts the ports on the core border', () => {
-    const data = loadLayoutData('order-service');
-    const result = runOnionLayoutCore(data, 'vertical');
+    const { data, result } = laidOut('order-service', 'vertical');
     const core = result.frames.get('core')!;
     for (const port of data.nodes.filter((n) => !n.isGroup && n.parentId === 'core')) {
       const centre = { x: port.x!, y: port.y! };
@@ -268,8 +288,7 @@ describe('runOnionLayoutCore on the order service onion', () => {
   });
 
   it('gives each ring a roof depth of its own', () => {
-    const data = loadLayoutData('order-service');
-    runOnionLayoutCore(data, 'vertical');
+    const { data } = laidOut('order-service', 'vertical');
     const depths = ringFrames(data).map((n) => n.hexagonPointDepth!);
     expect(depths).toHaveLength(4);
     expect(new Set(depths).size).toBeGreaterThan(1);
@@ -277,16 +296,14 @@ describe('runOnionLayoutCore on the order service onion', () => {
   });
 
   it('sizes the side groups but gives them no frame depth', () => {
-    const data = loadLayoutData('order-service');
-    runOnionLayoutCore(data, 'vertical');
+    const { data } = laidOut('order-service', 'vertical');
     expect(ringFrames(data).map((n) => n.id)).not.toContain('driving');
     expect(data.nodes.find((n) => n.id === 'driving')!.width).toBeGreaterThan(0);
   });
 
   it('gives the same layout twice', () => {
-    const a = loadLayoutData('order-service');
+    const a = laidOut('order-service', 'vertical').data;
     const b = loadLayoutData('order-service');
-    runOnionLayoutCore(a, 'vertical');
     runOnionLayoutCore(b, 'vertical');
     expect(a.nodes.map((n) => [n.x, n.y])).toEqual(b.nodes.map((n) => [n.x, n.y]));
   });
@@ -296,50 +313,48 @@ describe('runOnionLayoutCore on the order service onion', () => {
       swapPasses: 0,
       sweeps: 0,
     });
-    const searched = runOnionLayoutCore(loadLayoutData('order-service'), 'vertical');
+    const searched = laidOut('order-service', 'vertical').result;
     expect(searched.conflicts).toBeLessThan(plain.conflicts);
     expect(searched.crossings).toBeLessThan(plain.crossings);
   });
 
   it('keeps the vertical layout within the area and aspect targets', () => {
-    const result = runOnionLayoutCore(loadLayoutData('order-service'), 'vertical');
+    const { result } = laidOut('order-service', 'vertical');
     expect(result.width * result.height).toBeLessThanOrEqual(3e6);
     expect(result.width / result.height).toBeGreaterThanOrEqual(0.6);
     expect(result.width / result.height).toBeLessThanOrEqual(1.6);
   });
 
-  it('lays the diagram out in a few seconds at most', () => {
-    runOnionLayoutCore(loadLayoutData('order-service'), 'vertical');
+  // A wall-clock budget, as in the grid layout's performance spec: CI runs unit tests with V8
+  // coverage, which slows the search several times over.
+  it.skipIf(Boolean(process.env.CI))('lays the diagram out in well under two seconds', () => {
+    laidOut('order-service', 'vertical');
     const started = performance.now();
     runOnionLayoutCore(loadLayoutData('order-service'), 'vertical');
-    expect(performance.now() - started).toBeLessThan(3000);
+    expect(performance.now() - started).toBeLessThan(2000);
   });
 });
 
-describe('runOnionLayoutCore on the bookmark service', () => {
+describe('runOnionLayoutCore on the bookmark service', FIXTURE_TIMEOUT, () => {
   it.each(ARRANGEMENTS)('keeps every rule in the %s arrangement', (arrangement) => {
-    const data = loadLayoutData('bookmark-service');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('bookmark-service', arrangement);
     expect(allInvariants(data, result, arrangement)).toEqual(CLEAN);
   });
 
   it.each(ARRANGEMENTS)('sets two adapters of one port side by side (%s)', (arrangement) => {
-    const data = loadLayoutData('bookmark-service');
-    runOnionLayoutCore(data, arrangement);
+    const { data } = laidOut('bookmark-service', arrangement);
     const [sqlite, memory] = ['sqlite', 'memory'].map((id) => leafBoxes(data).get(id)!);
     expect(boxesOverlap(inflateBox(sqlite, 8), inflateBox(memory, 8))).toBe(false);
   });
 
   it('keeps the driving port off the core title on the top roof', () => {
-    const data = loadLayoutData('bookmark-service');
-    const result = runOnionLayoutCore(data, 'vertical');
+    const { data, result } = laidOut('bookmark-service', 'vertical');
     const title = result.frames.get('core')!.title;
     expect(boxesOverlap(leafBoxes(data).get('service_port')!, title)).toBe(false);
   });
 
   it('ends every edge on the outline of the shapes it joins', () => {
-    const data = loadLayoutData('bookmark-service');
-    runOnionLayoutCore(data, 'horizontal');
+    const { data } = laidOut('bookmark-service', 'horizontal');
     const byId = new Map(data.nodes.map((n) => [n.id, n]));
     for (const edge of data.edges.filter((e) => e.start !== e.end)) {
       const ends = [
@@ -358,17 +373,15 @@ describe('runOnionLayoutCore on the bookmark service', () => {
   });
 });
 
-describe('runOnionLayoutCore on other shapes of input', () => {
+describe('runOnionLayoutCore on other shapes of input', FIXTURE_TIMEOUT, () => {
   it.each(ARRANGEMENTS)('lays out a diagram with no adapters ring (%s)', (arrangement) => {
-    const data = loadLayoutData('no-adapters');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('no-adapters', arrangement);
     expect([...result.frames.keys()].sort()).toEqual(['app', 'core', 'domain']);
     expect(allInvariants(data, result, arrangement)).toEqual(CLEAN);
   });
 
   it.each(ARRANGEMENTS)('lays out a diagram with no domain ring (%s)', (arrangement) => {
-    const data = loadLayoutData('no-domain');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('no-domain', arrangement);
     expect([...result.frames.keys()].sort()).toEqual(['adapters', 'app', 'core']);
     // With no domain the application ring is packed as the centre grid, and an edge from a
     // centred port can run down a grid column across the cell above its target: at most one per
@@ -383,15 +396,13 @@ describe('runOnionLayoutCore on other shapes of input', () => {
   });
 
   it.each(ARRANGEMENTS)('lays out a diagram with no driven ports (%s)', (arrangement) => {
-    const data = loadLayoutData('no-driven');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('no-driven', arrangement);
     expect(analyseOnion(data).ports.every((p) => p.kind === 'driving')).toBe(true);
     expect(allInvariants(data, result, arrangement)).toEqual(CLEAN);
   });
 
   it.each(ARRANGEMENTS)('lays out the small onion (%s)', (arrangement) => {
-    const data = loadLayoutData('small-onion');
-    const result = runOnionLayoutCore(data, arrangement);
+    const { data, result } = laidOut('small-onion', arrangement);
     expect(allInvariants(data, result, arrangement)).toEqual(CLEAN);
   });
 
@@ -458,8 +469,7 @@ describe('runOnionLayoutCore on other shapes of input', () => {
   });
 
   it('routes a self-loop as a small loop beside its node', () => {
-    const data = loadLayoutData('self-loop');
-    const result = runOnionLayoutCore(data, 'vertical');
+    const { data, result } = laidOut('self-loop', 'vertical');
     const loop = data.edges.find((e) => e.start === e.end)!;
     const node = data.nodes.find((n) => n.id === loop.start)!;
     expect(loop.points).toHaveLength(5);
@@ -469,8 +479,7 @@ describe('runOnionLayoutCore on other shapes of input', () => {
   });
 
   it('draws parallel edges side by side with their own labels', () => {
-    const data = loadLayoutData('parallel');
-    const result = runOnionLayoutCore(data, 'vertical');
+    const { data, result } = laidOut('parallel', 'vertical');
     const pair = data.edges.filter((e) => e.start === 'rest' && e.end === 'order_port');
     expect(pair).toHaveLength(2);
     expect(pair[0].points![1]).not.toEqual(pair[1].points![1]);

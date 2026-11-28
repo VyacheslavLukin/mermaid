@@ -210,23 +210,34 @@ function spokePoint(
 }
 
 /**
+ * Coarse steps a search keeps going without finding fewer overlaps before it settles for the
+ * fewest it found: an overlap that growing the parameter cannot clear, such as an edge between
+ * two leaves running through a third, would otherwise walk it to the end of its range.
+ */
+const SEARCH_PATIENCE = 10;
+
+/**
  * Smallest value of a rising parameter whose trial clears every overlap beyond `allowed`; the
  * value with the fewest overlaps when none does. A coarse pass finds the neighbourhood, a fine
  * pass walks back to the first clear step inside it.
+ *
+ * `conflictsAt(value, limit)` may stop counting at `limit`: a trial only needs counting up to
+ * the fewest overlaps found so far, since one with as many or more changes nothing.
  */
 function searchSmallest(
   from: number,
   to: number,
   step: number,
-  conflictsAt: (value: number) => number,
+  conflictsAt: (value: number, limit: number) => number,
   allowed: number
 ): number {
   const coarse = step * 5;
   let best = from;
   let bestCount = Number.POSITIVE_INFINITY;
+  let stale = 0;
   let hit: number | undefined;
-  for (let v = from; v <= to; v += coarse) {
-    const count = conflictsAt(v);
+  for (let v = from; v <= to && stale < SEARCH_PATIENCE; v += coarse) {
+    const count = conflictsAt(v, bestCount);
     if (count <= allowed) {
       hit = v;
       break;
@@ -234,13 +245,16 @@ function searchSmallest(
     if (count < bestCount) {
       bestCount = count;
       best = v;
+      stale = 0;
+    } else {
+      stale++;
     }
   }
   if (hit === undefined) {
     return best;
   }
   for (let v = Math.max(from, hit - coarse + step); v < hit; v += step) {
-    if (conflictsAt(v) <= allowed) {
+    if (conflictsAt(v, allowed + 1) <= allowed) {
       return v;
     }
   }
@@ -420,12 +434,48 @@ function fanOut(ctx: Context, sides: Map<string, SpokeSide>): void {
   }
 }
 
+/**
+ * Layouts already solved, per diagram: the search reaches some orders more than once (a polish
+ * swap the sweep already tried, a restart that lands on the same order), and a solve is pure.
+ */
+const solved = new WeakMap<Context, Map<string, Solution>>();
+
 function solve(
   ctx: Context,
   params: OrderParams,
   order: Order,
   spread = 1,
   nudges: Nudges = NO_NUDGES
+): Solution {
+  const key = JSON.stringify([
+    params,
+    [...order.slot],
+    order.ringAngles,
+    order.gridCells,
+    spread,
+    [...nudges.turns],
+    nudges.gridGap,
+  ]);
+  let cache = solved.get(ctx);
+  if (!cache) {
+    cache = new Map();
+    solved.set(ctx, cache);
+  }
+  const known = cache.get(key);
+  if (known) {
+    return known;
+  }
+  const solution = solveFresh(ctx, params, order, spread, nudges);
+  cache.set(key, solution);
+  return solution;
+}
+
+function solveFresh(
+  ctx: Context,
+  params: OrderParams,
+  order: Order,
+  spread: number,
+  nudges: Nudges
 ): Solution {
   const { structure, arrangement } = ctx;
   const scene: Scene = { boxes: new Map(), frames: [] };
@@ -445,10 +495,10 @@ function solve(
     GRID_GAP + nudges.gridGap,
     400,
     4,
-    (gap) => {
+    (gap, limit) => {
       const trial = fitInnermost(gap);
       return withTrial(scene, trial.boxes, [frameShape(ctx, innermost.id, trial.frame)], () =>
-        countConflicts(ctx, scene)
+        countConflicts(ctx, scene, limit)
       );
     },
     0
@@ -480,10 +530,10 @@ function solve(
       30,
       3000,
       6,
-      (value) => {
+      (value, limit) => {
         const trial = ringAt(value);
         return withTrial(scene, trial.boxes, [frameShape(ctx, ring.id, trial.frame)], () =>
-          countConflicts(ctx, scene)
+          countConflicts(ctx, scene, limit)
         );
       },
       baseline
@@ -537,10 +587,10 @@ function solve(
     10,
     2500,
     6,
-    (t) => {
+    (t, limit) => {
       const trial = coreAt(t);
       return withTrial(scene, trial.boxes, [frameShape(ctx, core.id, trial.frame)], () =>
-        countConflicts(ctx, scene)
+        countConflicts(ctx, scene, limit)
       );
     },
     baselineCore
@@ -577,7 +627,8 @@ function solve(
     0,
     900,
     6,
-    (band) => withTrial(scene, adaptersAt(band), [], () => countConflicts(ctx, scene)),
+    (band, limit) =>
+      withTrial(scene, adaptersAt(band), [], () => countConflicts(ctx, scene, limit)),
     baselineAdapters
   );
   adaptersAt(adapterBand).forEach((box, id) => scene.boxes.set(id, box));
@@ -632,9 +683,9 @@ function solve(
       0,
       900,
       6,
-      (value) =>
+      (value, limit) =>
         withTrial(scene, new Map([[id, at(value)]]), [], () =>
-          scanNewNode(ctx, scene, id, settled)
+          scanNewNode(ctx, scene, id, settled, limit)
         ),
       0
     );
